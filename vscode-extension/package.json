@@ -1,0 +1,88 @@
+{
+    "name": "claude-local-agent",
+    "displayName": "Claude Local Agent",
+    "description": "AI coding assistant powered by your local Ollama model",
+    "version": "0.1.0",
+    "engines": {
+        "vscode": "^1.85.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "commands": [
+            {
+                "command": "claudeLocal.explain",
+                "title": "LocalAgent: Explain Selection"
+            },
+            {
+                "command": "claudeLocal.refactor",
+                "title": "LocalAgent: Refactor Selection"
+            },
+            {
+                "command": "claudeLocal.implement",
+                "title": "LocalAgent: Implement from Instruction"
+            }
+        ],
+        "menus": {
+            "editor/context": [
+                {
+                    "command": "claudeLocal.explain",
+                    "when": "editorHasSelection",
+                    "group": "claudeLocal@1"
+                },
+                {
+                    "command": "claudeLocal.refactor",
+                    "when": "editorHasSelection",
+                    "group": "claudeLocal@2"
+                },
+                {
+                    "command": "claudeLocal.implement",
+                    "group": "claudeLocal@3"
+                }
+            ]
+        },
+        "configuration": {
+            "title": "Claude Local Agent",
+            "properties": {
+                "claudeLocal.backendUrl": {
+                    "type": "string",
+                    "default": "http://localhost:4000",
+                    "description": "URL of the agent backend server"
+                },
+                "claudeLocal.workspaceRoot": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Root folder for code search (defaults to first workspace folder)"
+                },
+                "claudeLocal.defaultMode": {
+                    "type": "string",
+                    "enum": [
+                        "auto",
+                        "local",
+                        "web"
+                    ],
+                    "default": "auto",
+                    "description": "Search mode: auto (smart), local (code only), web (include web docs)"
+                }
+            }
+        }
+    },
+    "scripts": {
+        "vscode:prepublish": "npm run compile",
+        "compile": "tsc -p ./",
+        "watch": "tsc -watch -p ./"
+    },
+    "devDependencies": {
+        "@types/node": "^20.0.0",
+        "@types/vscode": "^1.85.0",
+        "typescript": "^5.3.0"
+    },
+    "dependencies": {
+        "axios": "^1.6.0"
+    }
+}
