@@ -10,6 +10,7 @@ A powerful, fully **local AI coding assistant** tailored for software engineers.
 
 ---
 
+
 ## ✨ Features
 
 - 🏎️ **Optimized Performance**: Leverages Ollama for fast, local inference.
