@@ -1,130 +1,55 @@
-/**
- * proxy/index.js
- * Anthropic-style API proxy server.
- *
- * Exposes:  POST /v1/messages  (Anthropic format)
- * Forwards: POST /api/chat     (Ollama format)
- *
- * Set these env vars before running Claude Code CLI:
- *   $env:ANTHROPIC_BASE_URL = "http://localhost:3000"
- *   $env:ANTHROPIC_API_KEY  = "local-model"
- */
+// proxy/index.js — Clean Ollama proxy with proper error handling
 
 require('dotenv').config();
 const express = require('express');
-const axios = require('axios');
-const cors = require('cors');
-const { toOllama } = require('./translators/toOllama');
-const { fromOllama, fromOllamaStreamChunk } = require('./translators/fromOllama');
+const axios   = require('axios');
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+const app        = express();
+const OLLAMA_URL = process.env.OLLAMA_URL  || 'http://localhost:11434';
+const MODEL      = process.env.OLLAMA_MODEL || 'qwen2.5-coder';
+const PORT       = process.env.PROXY_PORT   || 3000;
 
-const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://localhost:11434';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5-coder:7b';
-const PORT = process.env.PROXY_PORT || 3000;
+app.use(express.json({ limit: '4mb' }));
 
-// ─── Health check ────────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-    res.json({ status: 'ok', message: 'Claude Local Proxy is running', model: OLLAMA_MODEL });
-});
+// Health check
+app.get('/', (_req, res) => res.json({ status: 'ok', model: MODEL }));
 
-// ─── Models endpoint (Claude Code CLI calls this) ────────────────────────────
-app.get('/v1/models', (req, res) => {
-    res.json({
-        data: [
-            { id: OLLAMA_MODEL, object: 'model', created: Date.now(), owned_by: 'local' },
-        ],
-    });
-});
-
-// ─── Main messages endpoint ───────────────────────────────────────────────────
+// Anthropic-compatible messages endpoint → Ollama
 app.post('/v1/messages', async (req, res) => {
-    const anthropicBody = req.body;
-    const isStreaming = anthropicBody.stream === true;
+  const { messages = [], system, max_tokens = 2048, temperature = 0.2 } = req.body;
 
-    console.log(`\n[proxy] → ${anthropicBody.model || 'default'} | stream=${isStreaming}`);
-    console.log(`[proxy]   messages: ${(anthropicBody.messages || []).length} | system: ${!!anthropicBody.system}`);
+  // Build Ollama messages array
+  const ollamaMessages = [];
+  if (system) ollamaMessages.push({ role: 'system', content: system });
+  ollamaMessages.push(...messages);
 
-    // Convert Anthropic → Ollama format
-    const ollamaBody = toOllama(anthropicBody, OLLAMA_MODEL);
+  try {
+    const response = await axios.post(OLLAMA_URL + '/api/chat', {
+      model  : MODEL,
+      stream : false,
+      options: { temperature, num_predict: max_tokens },
+      messages: ollamaMessages,
+    }, { timeout: 120000 });
 
-    try {
-        if (isStreaming) {
-            // ── Streaming mode ───────────────────────────────────────────────────
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
+    const content = response.data?.message?.content || '';
 
-            const ollamaStream = await axios.post(`${OLLAMA_BASE_URL}/api/chat`, {
-                ...ollamaBody,
-                stream: true,
-            }, { responseType: 'stream' });
-
-            let chunkIndex = 0;
-            let buffer = '';
-
-            ollamaStream.data.on('data', (rawChunk) => {
-                buffer += rawChunk.toString();
-                const lines = buffer.split('\n');
-                buffer = lines.pop(); // keep incomplete line in buffer
-
-                for (const line of lines) {
-                    if (!line.trim()) continue;
-                    try {
-                        const chunk = JSON.parse(line);
-                        const events = fromOllamaStreamChunk(chunk, chunkIndex);
-                        chunkIndex++;
-
-                        for (const event of events) {
-                            res.write(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
-                        }
-
-                        if (chunk.done) {
-                            res.end();
-                        }
-                    } catch (e) {
-                        // Skip malformed JSON chunks
-                    }
-                }
-            });
-
-            ollamaStream.data.on('error', (err) => {
-                console.error('[proxy] Stream error:', err.message);
-                res.end();
-            });
-
-        } else {
-            // ── Non-streaming mode ───────────────────────────────────────────────
-            const ollamaRes = await axios.post(`${OLLAMA_BASE_URL}/api/chat`, {
-                ...ollamaBody,
-                stream: false,
-            });
-
-            const anthropicResponse = fromOllama(ollamaRes.data, anthropicBody.model);
-            console.log(`[proxy] ← response tokens: ${anthropicResponse.usage.output_tokens}`);
-            res.json(anthropicResponse);
-        }
-
-    } catch (err) {
-        const status = err.response?.status || 500;
-        const message = err.response?.data || err.message;
-        console.error('[proxy] Error calling Ollama:', message);
-        res.status(status).json({
-            type: 'error',
-            error: { type: 'api_error', message: `Ollama error: ${JSON.stringify(message)}` },
-        });
-    }
+    // Return Anthropic-shaped response for client compatibility
+    res.json({
+      id     : 'msg_' + Date.now(),
+      type   : 'message',
+      role   : 'assistant',
+      content: [{ type: 'text', text: content }],
+      model  : MODEL,
+      stop_reason: 'end_turn',
+      usage  : { input_tokens: 0, output_tokens: 0 },
+    });
+  } catch (err) {
+    const status = err.response?.status || 502;
+    const detail = err.response?.data || err.message;
+    console.error('[proxy] Ollama error:', detail);
+    res.status(status).json({ error: 'LLM request failed', detail });
+  }
 });
 
-// ─── Start ───────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-    console.log(`\n✅ Claude Local Proxy running on http://localhost:${PORT}`);
-    console.log(`   Forwarding to Ollama at: ${OLLAMA_BASE_URL}`);
-    console.log(`   Model: ${OLLAMA_MODEL}`);
-    console.log(`\n   To use with Claude Code CLI, run:`);
-    console.log(`   $env:ANTHROPIC_BASE_URL = "http://localhost:${PORT}"`);
-    console.log(`   $env:ANTHROPIC_API_KEY  = "local-model"`);
-    console.log(`   claude\n`);
-});
+app.listen(PORT, () => console.log('[proxy] Listening on :' + PORT));
+

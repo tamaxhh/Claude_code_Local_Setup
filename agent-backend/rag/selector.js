@@ -1,72 +1,104 @@
-/**
- * rag/selector.js
- * Selects the most relevant text chunks from fetched web pages.
- *
- * Uses keyword overlap scoring (no embeddings needed, no GPU required).
- * For each chunk, counts how many words from the question appear in it.
- *
- * Returns: Top N chunks as a single combined string for the LLM prompt.
- */
+// selector.js — Chunk ranking via keyword overlap + bigram TF-IDF approximation
 
-const STOP_WORDS = new Set([
-    'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-    'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-    'should', 'may', 'might', 'shall', 'can', 'need', 'dare', 'ought',
-    'used', 'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from',
-    'this', 'that', 'it', 'its', 'and', 'or', 'but', 'if', 'not', 'i',
-    'you', 'we', 'they', 'he', 'she', 'what', 'how', 'when', 'where', 'why',
+const STOP = new Set(['the','a','an','is','are','was','were','be','been','in','of','to','for',
+  'and','or','but','how','what','where','which','does','do','my','this','that','with','from',
+  'it','can','i','on','at','by','we','you','they','he','she','its','our','your','their',
+  'if','so','as','not','no','has','have','had','will','would','could','should','may','might',
+  'then','than','when','while','just','also','more','some','all','any','into','about','up',
 ]);
 
 function tokenize(text) {
-    return text
-        .toLowerCase()
-        .replace(/[^a-z0-9\s]/g, ' ')
-        .split(/\s+/)
-        .filter((w) => w.length > 2 && !STOP_WORDS.has(w));
+  return text
+    .toLowerCase()
+    .replace(/[^\\w \\s]/g, ' ')
+    .split(/\\s+/)
+    .filter(w => w.length > 2 && !STOP.has(w));
 }
 
-function scoreChunk(chunk, questionTokens) {
-    const chunkTokens = new Set(tokenize(chunk.text));
-    let matches = 0;
-    for (const token of questionTokens) {
-        if (chunkTokens.has(token)) matches++;
+function termFreq(tokens) {
+  const tf = {};
+  for (const t of tokens) {
+    tf[t] = (tf[t] || 0) + 1;
+  }
+  return tf;
+}
+
+function keywordScore(queryTokens, chunkTokens) {
+  const qSet = new Set(queryTokens);
+  const cTF = termFreq(chunkTokens);
+  let score = 0;
+
+  for (const term of qSet) {
+    if (cTF[term]) {
+      score += 1 + Math.min(cTF[term] - 1, 2) * 0.3;
     }
-    return matches;
+  }
+
+  return score / (qSet.size + 1);
 }
 
-/**
- * @param {Array<{url, chunkIndex, text}>} chunks - All fetched chunks
- * @param {string} question - The user's question
- * @param {number} topN - How many chunks to return
- * @returns {string} Combined context string ready to inject into LLM prompt
- */
-function selectTopChunks(chunks, question, topN = 6) {
-    if (!chunks || chunks.length === 0) return '';
-
-    const questionTokens = tokenize(question);
-
-    const scored = chunks.map((chunk) => ({
-        ...chunk,
-        score: scoreChunk(chunk, questionTokens),
-    }));
-
-    // Sort by score descending, take top N
-    const topChunks = scored
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topN)
-        .filter((c) => c.score > 0); // Only include chunks with at least 1 match
-
-    if (topChunks.length === 0) {
-        // Fallback: just take the first N chunks if nothing matched
-        return chunks
-            .slice(0, 3)
-            .map((c) => `[Source: ${c.url}]\n${c.text}`)
-            .join('\n\n---\n\n');
+function bigramScore(queryTokens, chunkTokens) {
+  const bigrams = (tokens) => {
+    const bg = new Set();
+    for (let i = 0; i < tokens.length - 1; i++) {
+      bg.add(tokens[i] + ':' + tokens[i+1]);
     }
+    return bg;
+  };
 
-    return topChunks
-        .map((c) => `[Source: ${c.url} | relevance: ${c.score}]\n${c.text}`)
-        .join('\n\n---\n\n');
+  const qBG = bigrams(queryTokens);
+  const cBG = bigrams(chunkTokens);
+  if (qBG.size === 0) return 0;
+
+  let overlap = 0;
+  for (const bg of qBG) {
+    if (cBG.has(bg)) overlap++;
+  }
+  return overlap / qBG.size;
 }
 
-module.exports = { selectTopChunks };
+function lengthPenalty(text) {
+  const len = text.length;
+  if (len < 150) return 0.5;
+  if (len > 4000) return 0.8;
+  return 1.0;
+}
+
+function deduplicate(scored) {
+  const selected = [];
+
+  for (const item of scored) {
+    const itemSet = new Set(tokenize(item.chunk.text));
+    const isDup = selected.some(sel => {
+      const selSet = new Set(tokenize(sel.chunk.text));
+      const inter = [...itemSet].filter(t => selSet.has(t)).length;
+      const union = new Set([...itemSet, ...selSet]).size;
+      return inter / union > 0.6;
+    });
+    if (!isDup) selected.push(item);
+  }
+
+  return selected;
+}
+
+function selectTopChunks(query, chunks, topK = 4) {
+  if (!chunks || chunks.length === 0) return [];
+
+  const qTokens = tokenize(query);
+  if (qTokens.length === 0) return chunks.slice(0, topK);
+
+  const scored = chunks.map(chunk => {
+    const cTokens = tokenize(chunk.text);
+    const score = keywordScore(qTokens, cTokens) * 0.6 +
+                  bigramScore(qTokens, cTokens) * 0.4;
+    return { chunk, score: score * lengthPenalty(chunk.text) };
+  });
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const deduped = deduplicate(scored);
+  return deduped.slice(0, topK).map(s => s.chunk);
+}
+
+module.exports = { selectTopChunks, tokenize };
+

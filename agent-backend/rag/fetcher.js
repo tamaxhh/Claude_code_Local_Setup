@@ -1,69 +1,87 @@
-/**
- * rag/fetcher.js
- * Fetches a web page and breaks it into text chunks.
- * Uses cheerio to extract clean text, skipping nav/footer/ads.
- *
- * Returns: Array of { url, chunkIndex, text }
- */
+// fetcher.js — URL fetcher + HTML cleaner + token-aware chunker
 
 const axios = require('axios');
-const cheerio = require('cheerio');
+const { JSDOM } = require('jsdom');
 
-const CHUNK_SIZE = 800;  // characters per chunk
-const MAX_CHUNKS_PER_PAGE = 20;
+const CHUNK_TARGET_CHARS = 1600;
+const CHUNK_MAX_CHARS    = 3200;
+const FETCH_TIMEOUT_MS   = 10000;
 
-async function fetchAndChunk(url) {
-    try {
-        const res = await axios.get(url, {
-            timeout: 10000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LocalAgent/1.0)' },
-            maxContentLength: 500_000, // 500 KB max
-        });
+/**
+ * Fetch a URL and return its cleaned text content.
+ */
+async function fetchText(url) {
+  const res = await axios.get(url, {
+    timeout: FETCH_TIMEOUT_MS,
+    maxContentLength: 2000000,
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AIAgent/1.0)' },
+    responseType: 'text',
+  });
 
-        const $ = cheerio.load(res.data);
+  const contentType = res.headers['content-type'] || '';
 
-        // Remove noisy elements
-        $('script, style, nav, footer, header, aside, .sidebar, .menu, .ad, .ads, .advertisement').remove();
+  if (contentType.includes('text/html')) {
+    return cleanHtml(res.data, url);
+  }
 
-        // Extract text from meaningful elements
-        const textParts = [];
-        $('p, h1, h2, h3, h4, pre, code, li, blockquote').each((_, el) => {
-            const text = $(el).text().trim();
-            if (text.length > 30) {
-                textParts.push(text);
-            }
-        });
-
-        const fullText = textParts.join('\n\n');
-
-        // Split into fixed-size chunks with overlap
-        const chunks = [];
-        let i = 0;
-        while (i < fullText.length && chunks.length < MAX_CHUNKS_PER_PAGE) {
-            const chunkText = fullText.slice(i, i + CHUNK_SIZE);
-            if (chunkText.trim().length > 50) {
-                chunks.push({
-                    url,
-                    chunkIndex: chunks.length,
-                    text: chunkText,
-                });
-            }
-            i += CHUNK_SIZE - 100; // 100 char overlap
-        }
-
-        return chunks;
-    } catch (err) {
-        console.error(`[fetcher] Failed to fetch ${url}: ${err.message}`);
-        return [];
-    }
+  return res.data.slice(0, 50000);
 }
 
 /**
- * Fetch multiple URLs in parallel and return all chunks.
+ * Strip HTML noise; extract meaningful text.
  */
-async function fetchMultipleAndChunk(urls) {
-    const allChunks = await Promise.all(urls.map((url) => fetchAndChunk(url)));
-    return allChunks.flat();
+function cleanHtml(html, url) {
+  const dom  = new JSDOM(html, { url });
+  const doc  = dom.window.document;
+
+  for (const sel of ['script','style','nav','footer','header','aside','noscript','form','svg','iframe']) {
+    doc.querySelectorAll(sel).forEach(el => el.remove());
+  }
+
+  const main = doc.querySelector('article') || doc.querySelector('main') || doc.body;
+  const text = main?.textContent || '';
+
+  return text
+    .replace(/\\s{3,}/g, '\\n\\n')
+    .replace(/\\n{4,}/g, '\\n\\n\\n')
+    .trim()
+    .slice(0, 50000);
 }
 
-module.exports = { fetchAndChunk, fetchMultipleAndChunk };
+/**
+ * Split text into overlapping chunks for RAG.
+ */
+function chunkText(text, source) {
+  const paragraphs = text.split(/\\n{2,}/);
+  const chunks     = [];
+  let buffer       = '';
+
+  for (const para of paragraphs) {
+    if (!para.trim()) continue;
+
+    if ((buffer + para).length > CHUNK_MAX_CHARS && buffer.length >= CHUNK_TARGET_CHARS) {
+      chunks.push({ text: buffer.trim(), source });
+      const sentences = buffer.split(/(?<=[.!?])\\s+/);
+      buffer = sentences.slice(-2).join(' ') + '\\n\\n' + para;
+    } else {
+      buffer += (buffer ? '\\n\\n' : '') + para;
+    }
+  }
+
+  if (buffer.trim().length > 100) {
+    chunks.push({ text: buffer.trim(), source });
+  }
+
+  return chunks;
+}
+
+/**
+ * Fetch a URL and return an array of text chunks ready for RAG.
+ */
+async function fetchAndChunk(url) {
+  const text = await fetchText(url);
+  return chunkText(text, url);
+}
+
+module.exports = { fetchAndChunk, fetchText, chunkText };
+

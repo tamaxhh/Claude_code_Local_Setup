@@ -1,82 +1,82 @@
-/**
- * tools/webSearch.js
- * Searches the web using the Brave Search API (free tier: 2000 queries/month).
- * Falls back to DuckDuckGo instant answer API if no key is configured.
- *
- * Returns: Array of { title, url, snippet }
- */
+// webSearch.js — Web search with Brave API + graceful DuckDuckGo fallback
 
 const axios = require('axios');
 
-const BRAVE_API_KEY = process.env.BRAVE_API_KEY;
-const BRAVE_ENDPOINT = 'https://api.search.brave.com/res/v1/web/search';
-const DDG_ENDPOINT = 'https://api.duckduckgo.com/';
+const BRAVE_API_KEY = process.env.BRAVE_API_KEY || '';
 
-async function webSearch(query, maxResults = 5) {
-    console.log(`[webSearch] Searching: "${query}"`);
+/**
+ * Search using Brave Search API (preferred).
+ */
+async function braveSearch(query) {
+  const res = await axios.get('https://api.search.brave.com/res/v1/web/search', {
+    headers: {
+      'Accept'              : 'application/json',
+      'Accept-Encoding'     : 'gzip',
+      'X-Subscription-Token': BRAVE_API_KEY,
+    },
+    params : { q: query, count: 5 },
+    timeout: 8000,
+  });
 
-    if (BRAVE_API_KEY) {
-        return braveSearch(query, maxResults);
-    }
-    // Fallback to DDG (limited results, no API key needed)
-    return ddgSearch(query);
+  const results = res.data?.web?.results || [];
+  return results.map(r => ({
+    title      : r.title,
+    url        : r.url,
+    description: r.description || '',
+  }));
 }
 
-async function braveSearch(query, maxResults) {
-    try {
-        const res = await axios.get(BRAVE_ENDPOINT, {
-            headers: {
-                'Accept': 'application/json',
-                'Accept-Encoding': 'gzip',
-                'X-Subscription-Token': BRAVE_API_KEY,
-            },
-            params: { q: query, count: maxResults },
-            timeout: 10000,
-        });
-
-        const webResults = res.data?.web?.results || [];
-        return webResults.slice(0, maxResults).map((r) => ({
-            title: r.title || '',
-            url: r.url || '',
-            snippet: r.description || '',
-        }));
-    } catch (err) {
-        console.error('[webSearch] Brave API error:', err.message);
-        return [{ error: `Brave search failed: ${err.message}` }];
-    }
-}
-
+/**
+ * Fallback: DuckDuckGo Instant Answer API (no key, limited but free).
+ */
 async function ddgSearch(query) {
-    try {
-        const res = await axios.get(DDG_ENDPOINT, {
-            params: { q: query, format: 'json', no_redirect: 1, no_html: 1 },
-            timeout: 10000,
-        });
+  const res = await axios.get('https://api.duckduckgo.com/', {
+    params : { q: query, format: 'json', no_redirect: 1, no_html: 1, skip_disambig: 1 },
+    timeout: 8000,
+  });
 
-        const results = [];
-        const data = res.data;
+  const results = [];
 
-        // DDG instant answer
-        if (data.AbstractText) {
-            results.push({ title: data.Heading || query, url: data.AbstractURL || '', snippet: data.AbstractText });
-        }
+  if (res.data?.AbstractURL) {
+    results.push({
+      title      : res.data.Heading || query,
+      url        : res.data.AbstractURL,
+      description: res.data.AbstractText || '',
+    });
+  }
 
-        // Related topics
-        if (data.RelatedTopics) {
-            for (const topic of data.RelatedTopics.slice(0, 4)) {
-                if (topic.Text && topic.FirstURL) {
-                    results.push({ title: topic.Text.slice(0, 80), url: topic.FirstURL, snippet: topic.Text });
-                }
-            }
-        }
-
-        return results.length > 0
-            ? results
-            : [{ title: 'No results', url: '', snippet: 'DDG returned no instant answers. Add BRAVE_API_KEY to .env for full web search.' }];
-    } catch (err) {
-        console.error('[webSearch] DDG error:', err.message);
-        return [{ error: `Web search failed: ${err.message}` }];
+  for (const topic of (res.data?.RelatedTopics || []).slice(0, 4)) {
+    if (topic.FirstURL && topic.Text) {
+      results.push({ title: topic.Text.slice(0, 80), url: topic.FirstURL, description: topic.Text });
     }
+  }
+
+  return results;
+}
+
+/**
+ * Main export — tries Brave first, falls back to DDG, then returns empty.
+ */
+async function webSearch(query) {
+  if (BRAVE_API_KEY) {
+    try {
+      const results = await braveSearch(query);
+      if (results.length > 0) return results;
+    } catch (e) {
+      console.warn('[webSearch] Brave failed:', e.message);
+    }
+  }
+
+  try {
+    const results = await ddgSearch(query);
+    if (results.length > 0) return results;
+  } catch (e) {
+    console.warn('[webSearch] DDG failed:', e.message);
+  }
+
+  console.warn('[webSearch] All search providers failed — returning empty.');
+  return [];
 }
 
 module.exports = { webSearch };
+
